@@ -1,4 +1,4 @@
-```python
+
 from pathlib import Path
 import os
 import shutil
@@ -727,4 +727,3 @@ except Exception as exc:
 
     with st.expander("PatchCore technical error"):
         st.exception(exc)
-```
