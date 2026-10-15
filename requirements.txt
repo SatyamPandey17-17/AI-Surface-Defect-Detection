@@ -4,3 +4,4 @@ numpy
 matplotlib
 Pillow
 huggingface_hub
+ultralytics
