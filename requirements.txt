@@ -1,7 +1,8 @@
+
+streamlit
 anomalib==2.7.0
-streamlit==1.66.0
+ultralytics
+huggingface_hub
 numpy
 matplotlib
 Pillow
-huggingface_hub
-ultralytics
