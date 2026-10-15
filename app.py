@@ -1,4 +1,4 @@
-
+import torch
 import os
 from pathlib import Path
 import tempfile
@@ -48,9 +48,28 @@ def download_checkpoint():
 
 
 try:
-    CHECKPOINT = Path(download_checkpoint())
+    downloaded_checkpoint = Path(download_checkpoint())
+
+    @st.cache_resource(show_spinner="Preparing CPU-compatible checkpoint...")
+    def prepare_cpu_checkpoint(checkpoint_path):
+        cpu_path = Path(tempfile.gettempdir()) / "patchcore_cpu.ckpt"
+
+        if not cpu_path.exists():
+            checkpoint = torch.load(
+                checkpoint_path,
+                map_location="cpu",
+                weights_only=False,
+            )
+            torch.save(checkpoint, cpu_path)
+
+        return str(cpu_path)
+
+    CHECKPOINT = Path(
+        prepare_cpu_checkpoint(str(downloaded_checkpoint))
+    )
+
 except Exception as exc:
-    st.error("Unable to download the PatchCore model from Hugging Face.")
+    st.error("Unable to prepare the PatchCore model.")
     st.exception(exc)
     st.stop()
 
@@ -90,9 +109,10 @@ if uploaded_file is not None:
                         pre_trained=True,
                     )
 
-                    engine = Engine(
-                        accelerator="auto",
-                        devices=1,
+                         engine = Engine(
+                              accelerator="cpu",
+                              devices=1,
+)
                     )
 
                     predictions = engine.predict(
