@@ -1,4 +1,4 @@
-
+```python
 from pathlib import Path
 import os
 import shutil
@@ -18,31 +18,28 @@ from huggingface_hub import hf_hub_download
 
 
 # ============================================================
-# PATHS AND CONFIGURATION
+# 1. PATHS AND MODEL CONFIGURATION
 # ============================================================
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
 HF_REPO_ID = "satyam17-17/surface-defect-patchcore"
-HF_FILENAME = "model.ckpt"
+
+PATCHCORE_FILENAME = "model.ckpt"
+YOLO_FILENAME = "best.pt"
 
 PATCHCORE_CHECKPOINT = PROJECT_DIR / "model.ckpt"
 CPU_CHECKPOINT = PROJECT_DIR / "model_cpu.ckpt"
 
-YOLO_CHECKPOINT = (
-    PROJECT_DIR
-    / "runs"
-    / "detect"
-    / "runs"
-    / "neu"
-    / "yolo11n_neu"
-    / "weights"
-    / "best.pt"
-)
+# Optional local YOLO checkpoint.
+YOLO_MODEL_PATH = PROJECT_DIR / "best.pt"
+
+# Hugging Face repository containing both model files.
+YOLO_REPO_ID = HF_REPO_ID
 
 
 # ============================================================
-# STREAMLIT PAGE
+# 2. STREAMLIT PAGE CONFIGURATION
 # ============================================================
 
 st.set_page_config(
@@ -52,17 +49,20 @@ st.set_page_config(
 )
 
 st.title("🔍 AI Surface Defect Detection")
+
 st.caption(
-    "PatchCore anomaly inspection + YOLO steel-defect classification"
+    "AI-powered steel surface inspection using "
+    "PatchCore anomaly detection and YOLO defect detection."
 )
 
 
 # ============================================================
-# HUGGING FACE TOKEN
+# 3. HUGGING FACE TOKEN
 # ============================================================
 
 def get_hf_token():
-    """Read the Hugging Face token from Streamlit Secrets or environment."""
+    """Read the optional Hugging Face token."""
+
     try:
         token = st.secrets.get("HF_TOKEN", None)
         if token:
@@ -74,12 +74,11 @@ def get_hf_token():
 
 
 # ============================================================
-# DOWNLOAD PATCHCORE CHECKPOINT
+# 4. DOWNLOAD PATCHCORE CHECKPOINT
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def ensure_patchcore_checkpoint():
-    """Download the PatchCore checkpoint if it is not already present."""
 
     if (
         PATCHCORE_CHECKPOINT.is_file()
@@ -91,7 +90,7 @@ def ensure_patchcore_checkpoint():
 
     downloaded_path = hf_hub_download(
         repo_id=HF_REPO_ID,
-        filename=HF_FILENAME,
+        filename=PATCHCORE_FILENAME,
         repo_type="model",
         token=token,
     )
@@ -101,8 +100,13 @@ def ensure_patchcore_checkpoint():
     try:
         shutil.copyfile(downloaded_path, temporary_path)
 
-        if not temporary_path.is_file() or temporary_path.stat().st_size == 0:
-            raise RuntimeError("The downloaded PatchCore checkpoint is empty.")
+        if (
+            not temporary_path.is_file()
+            or temporary_path.stat().st_size == 0
+        ):
+            raise RuntimeError(
+                "The downloaded PatchCore checkpoint is empty."
+            )
 
         os.replace(temporary_path, PATCHCORE_CHECKPOINT)
 
@@ -114,21 +118,17 @@ def ensure_patchcore_checkpoint():
 
 
 # ============================================================
-# CONVERT CHECKPOINT TO CPU FORMAT
+# 5. PREPARE PATCHCORE CHECKPOINT FOR CPU
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
 def make_cpu_checkpoint(checkpoint_path):
-    """
-    Load the trusted checkpoint with CPU mapping and save a CPU-compatible
-    copy for Streamlit Cloud's CPU-only runtime.
-    """
 
     source = Path(checkpoint_path)
 
     if not source.is_file():
         raise FileNotFoundError(
-            f"PatchCore checkpoint was not found: {source}"
+            f"PatchCore checkpoint not found: {source}"
         )
 
     if (
@@ -141,7 +141,7 @@ def make_cpu_checkpoint(checkpoint_path):
     temporary_path = PROJECT_DIR / "model_cpu.tmp"
 
     try:
-        # Only load checkpoints from your trusted model repository.
+        # Use only a checkpoint from your trusted model repository.
         checkpoint = torch.load(
             str(source),
             map_location=torch.device("cpu"),
@@ -154,7 +154,9 @@ def make_cpu_checkpoint(checkpoint_path):
             not temporary_path.is_file()
             or temporary_path.stat().st_size == 0
         ):
-            raise RuntimeError("CPU checkpoint conversion produced an empty file.")
+            raise RuntimeError(
+                "CPU checkpoint conversion produced an empty file."
+            )
 
         os.replace(temporary_path, CPU_CHECKPOINT)
 
@@ -166,7 +168,42 @@ def make_cpu_checkpoint(checkpoint_path):
 
 
 # ============================================================
-# LOAD MODELS
+# 6. DOWNLOAD YOLO CHECKPOINT
+# ============================================================
+
+@st.cache_resource(show_spinner=False)
+def ensure_yolo_checkpoint():
+
+    # Use a local checkpoint if one has been included in deployment.
+    if (
+        YOLO_MODEL_PATH.is_file()
+        and YOLO_MODEL_PATH.stat().st_size > 0
+    ):
+        return str(YOLO_MODEL_PATH)
+
+    # Otherwise download best.pt from Hugging Face.
+    token = get_hf_token()
+
+    downloaded_path = hf_hub_download(
+        repo_id=YOLO_REPO_ID,
+        filename=YOLO_FILENAME,
+        repo_type="model",
+        token=token,
+    )
+
+    if not Path(downloaded_path).is_file():
+        raise FileNotFoundError(
+            "Hugging Face did not return a valid YOLO checkpoint."
+        )
+
+    if Path(downloaded_path).stat().st_size == 0:
+        raise RuntimeError("The downloaded YOLO checkpoint is empty.")
+
+    return str(downloaded_path)
+
+
+# ============================================================
+# 7. LOAD MODELS
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -176,6 +213,7 @@ def load_yolo_model(model_path):
 
 @st.cache_resource(show_spinner=False)
 def load_patchcore_model():
+
     model = Patchcore(
         backbone="wide_resnet50_2",
         pre_trained=True,
@@ -190,33 +228,42 @@ def load_patchcore_model():
 
 
 # ============================================================
-# MODEL STATUS
+# 8. MODEL INFORMATION
 # ============================================================
 
-with st.expander("Model status and supported classes", expanded=False):
-    st.write("**PatchCore:** Scratch-focused anomaly detection.")
+with st.expander(
+    "Model status and supported defect classes",
+    expanded=False,
+):
 
     st.write(
-        "**YOLO classes:** Crazing, inclusion, patches, pitted surface, "
-        "rolled-in scale, and scratches."
+        "**PatchCore:** Scratch-focused anomaly detection."
+    )
+
+    st.write(
+        "**YOLO classes:** Crazing, inclusion, patches, "
+        "pitted surface, rolled-in scale, and scratches."
+    )
+
+    st.write(
+        "**PatchCore checkpoint:** Downloaded from Hugging Face "
+        "when needed."
+    )
+
+    st.write(
+        "**YOLO checkpoint:** Downloaded from Hugging Face "
+        "when needed."
     )
 
     st.caption(
-        "PatchCore identifies anomalous regions. YOLO predicts defect "
-        "categories. Their outputs are separate and require validation."
-    )
-
-    st.write(
-        "**PatchCore checkpoint:** Downloaded from Hugging Face when needed."
-    )
-
-    st.write(
-        "**YOLO checkpoint:** Loaded from the project's local deployment files."
+        "The models work independently. PatchCore highlights unusual "
+        "regions, while YOLO predicts categories learned during "
+        "YOLO training."
     )
 
 
 # ============================================================
-# IMAGE INPUT
+# 9. IMAGE UPLOAD
 # ============================================================
 
 uploaded_file = st.file_uploader(
@@ -238,16 +285,21 @@ if uploaded_file is None:
 
 try:
     image = Image.open(uploaded_file).convert("RGB")
+
 except Exception as exc:
-    st.error(f"Unable to open image: {exc}")
+    st.error(f"Unable to open the uploaded image: {exc}")
     st.stop()
 
 st.subheader("Original image")
-st.image(image, use_container_width=True)
+
+st.image(
+    image,
+    use_container_width=True,
+)
 
 
 # ============================================================
-# INSPECT BUTTON
+# 10. INSPECTION BUTTON
 # ============================================================
 
 if not st.button("Inspect surface", type="primary"):
@@ -255,120 +307,139 @@ if not st.button("Inspect surface", type="primary"):
 
 
 # ============================================================
-# 1. YOLO DEFECT DETECTION
+# 11. YOLO DEFECT DETECTION
 # ============================================================
 
 st.header("1. YOLO defect detection")
 
-if not YOLO_CHECKPOINT.is_file():
+try:
 
-    st.warning(
-        "YOLO checkpoint best.pt is missing from the deployed project. "
-        "YOLO classification is unavailable until this file is hosted "
-        "or included in the deployment."
-    )
+    with st.spinner("Downloading and loading YOLO model..."):
 
-else:
-    try:
-        with st.spinner("Running YOLO defect detection..."):
+        yolo_checkpoint = ensure_yolo_checkpoint()
+        yolo_model = load_yolo_model(yolo_checkpoint)
 
-            yolo_model = load_yolo_model(str(YOLO_CHECKPOINT))
+    with st.spinner("Running YOLO defect detection..."):
 
-            yolo_results = yolo_model.predict(
-                source=np.asarray(image),
-                imgsz=320,
-                conf=confidence_threshold,
-                device="cpu",
-                verbose=False,
-            )
-
-        result = yolo_results[0]
-
-        # Ultralytics plot output is BGR; convert to RGB.
-        annotated = result.plot()
-        annotated = Image.fromarray(annotated[:, :, ::-1].copy())
-
-        st.image(
-            annotated,
-            caption="YOLO bounding-box predictions",
-            use_container_width=True,
+        yolo_results = yolo_model.predict(
+            source=np.asarray(image),
+            imgsz=320,
+            conf=confidence_threshold,
+            device="cpu",
+            verbose=False,
         )
 
-        boxes = result.boxes
+    result = yolo_results[0]
 
-        if boxes is not None and len(boxes) > 0:
+    # Ultralytics plot output is BGR. Convert to RGB.
+    annotated = result.plot()
+    annotated = Image.fromarray(
+        annotated[:, :, ::-1].copy()
+    )
 
-            rows = []
+    st.image(
+        annotated,
+        caption="YOLO bounding-box predictions",
+        use_container_width=True,
+    )
 
-            for box in boxes:
-                class_id = int(box.cls.item())
-                confidence = float(box.conf.item())
+    boxes = result.boxes
 
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
+    if boxes is not None and len(boxes) > 0:
 
-                rows.append(
-                    {
-                        "Defect type": result.names.get(
-                            class_id, str(class_id)
-                        ),
-                        "Confidence": f"{confidence * 100:.1f}%",
-                        "X1": round(x1, 1),
-                        "Y1": round(y1, 1),
-                        "X2": round(x2, 1),
-                        "Y2": round(y2, 1),
-                    }
-                )
+        rows = []
 
-            st.success(f"YOLO detected {len(rows)} object(s).")
+        for box in boxes:
 
-            st.dataframe(
-                rows,
-                use_container_width=True,
-                hide_index=True,
+            class_id = int(box.cls.item())
+            confidence = float(box.conf.item())
+
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+            rows.append(
+                {
+                    "Defect type": result.names.get(
+                        class_id,
+                        str(class_id),
+                    ),
+                    "Confidence": f"{confidence * 100:.1f}%",
+                    "X1": round(x1, 1),
+                    "Y1": round(y1, 1),
+                    "X2": round(x2, 1),
+                    "Y2": round(y2, 1),
+                }
             )
 
-        else:
-            st.warning(
-                "YOLO did not detect a defect at the selected confidence "
-                "threshold. This does not prove the surface is defect-free."
-            )
+        st.success(
+            f"YOLO detected {len(rows)} object(s)."
+        )
 
-    except Exception as exc:
-        st.error(f"YOLO detection failed: {exc}")
+        st.dataframe(
+            rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    else:
+
+        st.warning(
+            "YOLO did not detect a defect at the selected confidence "
+            "threshold. This does not prove the surface is defect-free."
+        )
+
+except Exception as exc:
+
+    st.error(
+        f"YOLO model loading or detection failed: {exc}"
+    )
+
+    with st.expander("YOLO technical error"):
         st.exception(exc)
 
 
 # ============================================================
-# 2. PATCHCORE ANOMALY INSPECTION
+# 12. PATCHCORE ANOMALY INSPECTION
 # ============================================================
 
 st.header("2. PatchCore anomaly inspection")
 
 try:
+
     # --------------------------------------------------------
-    # DOWNLOAD CHECKPOINT
+    # Download the trained checkpoint.
     # --------------------------------------------------------
 
-    with st.spinner("Checking and downloading PatchCore checkpoint..."):
+    with st.spinner(
+        "Checking and downloading PatchCore checkpoint..."
+    ):
+
         checkpoint_path = ensure_patchcore_checkpoint()
 
     # --------------------------------------------------------
-    # CONVERT TO CPU-COMPATIBLE CHECKPOINT
+    # Prepare a CPU-mapped checkpoint.
     # --------------------------------------------------------
 
-    with st.spinner("Preparing CPU-compatible PatchCore checkpoint..."):
-        cpu_checkpoint_path = make_cpu_checkpoint(checkpoint_path)
+    with st.spinner(
+        "Preparing CPU-compatible PatchCore checkpoint..."
+    ):
+
+        cpu_checkpoint_path = make_cpu_checkpoint(
+            checkpoint_path
+        )
 
     # --------------------------------------------------------
-    # SAVE TEMPORARY INPUT IMAGE AND RUN PREDICTION
+    # Run inference on the uploaded image.
     # --------------------------------------------------------
 
     with tempfile.TemporaryDirectory() as temp_dir:
 
         input_path = Path(temp_dir) / "input.png"
+
         image.save(input_path, format="PNG")
 
-        with st.spinner("Calculating anomaly score and heatmap..."):
+        with st.spinner(
+            "Calculating anomaly score and heatmap..."
+        ):
 
             patchcore_model, engine = load_patchcore_model()
 
@@ -379,17 +450,33 @@ try:
             )
 
     if predictions is None or len(predictions) == 0:
+
         st.warning("PatchCore returned no predictions.")
         st.stop()
 
     prediction = predictions[0]
 
-    anomaly_score = getattr(prediction, "pred_score", None)
-    anomaly_map = getattr(prediction, "anomaly_map", None)
-    pred_mask = getattr(prediction, "pred_mask", None)
+    anomaly_score = getattr(
+        prediction,
+        "pred_score",
+        None,
+    )
+
+    anomaly_map = getattr(
+        prediction,
+        "anomaly_map",
+        None,
+    )
+
+    pred_mask = getattr(
+        prediction,
+        "pred_mask",
+        None,
+    )
+
 
     # ========================================================
-    # ANOMALY SCORE
+    # 13. ANOMALY SCORE
     # ========================================================
 
     st.subheader("Anomaly score")
@@ -397,7 +484,9 @@ try:
     if anomaly_score is not None:
 
         if hasattr(anomaly_score, "detach"):
-            score_values = anomaly_score.detach().cpu().numpy()
+            score_values = (
+                anomaly_score.detach().cpu().numpy()
+            )
         else:
             score_values = np.asarray(anomaly_score)
 
@@ -408,7 +497,9 @@ try:
             neginf=0.0,
         )
 
-        score = float(score_values.reshape(-1)[0])
+        score = float(
+            score_values.reshape(-1)[0]
+        )
 
         st.metric(
             label="PatchCore anomaly score",
@@ -422,10 +513,14 @@ try:
         )
 
     else:
-        st.warning("PatchCore did not return an anomaly score.")
+
+        st.warning(
+            "PatchCore did not return an anomaly score."
+        )
+
 
     # ========================================================
-    # ANOMALY HEATMAP AND OVERLAY
+    # 14. ANOMALY HEATMAP AND OVERLAY
     # ========================================================
 
     st.subheader("Anomaly heatmap and overlay")
@@ -454,9 +549,12 @@ try:
             if high > low:
                 heat_norm = (heat - low) / (high - low)
             else:
-                heat_norm = np.zeros_like(heat, dtype=np.float32)
+                heat_norm = np.zeros_like(
+                    heat,
+                    dtype=np.float32,
+                )
 
-            # Resize the normalized heatmap to match the original image.
+            # Resize heatmap to the original image dimensions.
             heat_image = Image.fromarray(
                 (heat_norm * 255).astype(np.uint8)
             ).resize(
@@ -465,11 +563,13 @@ try:
             )
 
             heat_norm = (
-                np.asarray(heat_image).astype(np.float32) / 255.0
+                np.asarray(heat_image).astype(np.float32)
+                / 255.0
             )
 
             colored_heat = (
-                plt.get_cmap("jet")(heat_norm)[:, :, :3] * 255
+                plt.get_cmap("jet")(heat_norm)[:, :, :3]
+                * 255
             ).astype(np.uint8)
 
             heat_rgb = Image.fromarray(colored_heat)
@@ -483,6 +583,7 @@ try:
             col1, col2 = st.columns(2)
 
             with col1:
+
                 st.image(
                     heat_rgb,
                     caption="Anomaly heatmap",
@@ -490,6 +591,7 @@ try:
                 )
 
             with col2:
+
                 st.image(
                     overlay,
                     caption="Heatmap overlay",
@@ -497,20 +599,25 @@ try:
                 )
 
             st.caption(
-                "Colors represent relative anomaly intensity within this "
-                "image. The heatmap is normalized for visualization."
+                "Colors represent relative anomaly intensity within "
+                "this image. The heatmap is normalized for visualization."
             )
 
         else:
+
             st.warning(
                 "PatchCore returned an invalid anomaly-map shape."
             )
 
     else:
-        st.info("PatchCore did not return an anomaly map.")
+
+        st.info(
+            "PatchCore did not return an anomaly map."
+        )
+
 
     # ========================================================
-    # PREDICTED DEFECT MASK
+    # 15. PREDICTED DEFECT MASK
     # ========================================================
 
     st.subheader("PatchCore predicted defect mask")
@@ -538,7 +645,9 @@ try:
                 (mask > 0).astype(np.uint8) * 255
             )
 
-            mask_image = Image.fromarray(binary_mask).resize(
+            mask_image = Image.fromarray(
+                binary_mask
+            ).resize(
                 image.size,
                 Image.Resampling.NEAREST,
             )
@@ -550,21 +659,27 @@ try:
             )
 
             if not np.any(binary_mask):
+
                 st.warning(
                     "The predicted mask is all black. This does not "
                     "necessarily prove the surface is defect-free."
                 )
 
         else:
+
             st.warning(
                 "PatchCore returned an invalid predicted-mask shape."
             )
 
     else:
-        st.info("PatchCore did not return a predicted mask.")
+
+        st.info(
+            "PatchCore did not return a predicted mask."
+        )
+
 
     # ========================================================
-    # FINAL INTERPRETATION
+    # 16. FINAL INSPECTION SUMMARY
     # ========================================================
 
     st.divider()
@@ -572,18 +687,19 @@ try:
     st.subheader("Inspection summary")
 
     st.write(
-        "- **PatchCore** highlights unusual surface regions using the "
-        "trained anomaly-detection checkpoint."
+        "- **PatchCore:** Highlights unusual surface regions using "
+        "the trained anomaly-detection checkpoint."
     )
 
     st.write(
-        "- **YOLO** detects and labels defects when its separate trained "
-        "checkpoint is available."
+        "- **YOLO:** Detects and labels defects using its separately "
+        "trained checkpoint."
     )
 
     st.write(
-        "- The two models do not automatically validate or combine their "
-        "results into one final industrial inspection decision."
+        "- **Important:** Both models can make mistakes. Their outputs "
+        "should be validated against labelled test images before "
+        "industrial use."
     )
 
 except Exception as exc:
@@ -595,6 +711,7 @@ except Exception as exc:
     error_text = str(exc).lower()
 
     if "401" in error_text or "403" in error_text:
+
         st.warning(
             "Hugging Face access may be denied. Confirm that the model "
             "repository is public or configure HF_TOKEN in Streamlit "
@@ -602,9 +719,12 @@ except Exception as exc:
         )
 
     elif "cuda" in error_text:
+
         st.warning(
-            "The checkpoint may still contain device-specific tensors, "
-            "or another dependency may be attempting to use CUDA."
+            "The checkpoint may contain device-specific tensors, "
+            "or a dependency may be attempting to use CUDA."
         )
 
-    st.exception(exc)
+    with st.expander("PatchCore technical error"):
+        st.exception(exc)
+```
