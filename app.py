@@ -109,10 +109,10 @@ if uploaded_file is not None:
                         pre_trained=True,
                     )
 
-                         engine = Engine(
-                              accelerator="cpu",
-                              devices=1,
-)
+                    engine = Engine(
+                        accelerator="cpu",
+                        devices=1,
+                    )
                     )
 
                     predictions = engine.predict(
