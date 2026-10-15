@@ -1,8 +1,10 @@
-
 streamlit
-anomalib==2.7.0
-ultralytics
-huggingface_hub
 numpy
 matplotlib
 Pillow
+torch
+torchvision
+anomalib==2.7.0
+ultralytics
+huggingface_hub
+opencv-python-headless
