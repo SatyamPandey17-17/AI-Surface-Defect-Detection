@@ -18,18 +18,16 @@ from ultralytics import YOLO
 # PATHS
 # ============================================================
 
+
 PROJECT_DIR = Path(__file__).resolve().parent
 
-PATCHCORE_CHECKPOINT = (
-    PROJECT_DIR
-    / "results"
-    / "Patchcore"
-    / "surface_scratch"
-    / "latest"
-    / "weights"
-    / "lightning"
-    / "model.ckpt"
+CHECKPOINT_URL = (
+    "https://huggingface.co/satyam17-17/"
+    "surface-defect-patchcore/resolve/main/model.ckpt"
 )
+
+CHECKPOINT = PROJECT_DIR / "model.ckpt"
+
 
 # Use the original NEU-trained YOLO model, not the fine-tuned one.
 YOLO_CHECKPOINT = (
