@@ -1,5 +1,5 @@
 streamlit
-numpy
+numpy<escape><</escape>2
 matplotlib
 Pillow
 torch
