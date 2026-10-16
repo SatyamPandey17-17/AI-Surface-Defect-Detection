@@ -616,67 +616,7 @@ try:
         )
 
 
-    # ========================================================
-    # 15. PREDICTED DEFECT MASK
-    # ========================================================
-
-    st.subheader("PatchCore predicted defect mask")
-
-    if pred_mask is not None:
-
-        if hasattr(pred_mask, "detach"):
-            mask = pred_mask.detach().cpu().numpy()
-        else:
-            mask = np.asarray(pred_mask)
-
-        mask = np.squeeze(mask)
-
-        if mask.ndim == 2 and mask.size > 0:
-
-            mask = np.nan_to_num(
-                mask.astype(np.float32),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-
-            # Anomalib normally returns a binary predicted mask.
-            binary_mask = (
-                (mask > 0).astype(np.uint8) * 255
-            )
-
-            mask_image = Image.fromarray(
-                binary_mask
-            ).resize(
-                image.size,
-                Image.Resampling.NEAREST,
-            )
-
-            st.image(
-                mask_image,
-                caption="Binary predicted anomaly mask",
-                use_container_width=True,
-            )
-
-            if not np.any(binary_mask):
-
-                st.warning(
-                    "The predicted mask is all black. This does not "
-                    "necessarily prove the surface is defect-free."
-                )
-
-        else:
-
-            st.warning(
-                "PatchCore returned an invalid predicted-mask shape."
-            )
-
-    else:
-
-        st.info(
-            "PatchCore did not return a predicted mask."
-        )
-
+   
 
     # ========================================================
     # 16. FINAL INSPECTION SUMMARY
