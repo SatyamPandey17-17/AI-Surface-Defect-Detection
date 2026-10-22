@@ -1,44 +1,172 @@
+"""
+Builds the combined "Surface Inspection + Live Object Height" project.
 
+Usage:
+    python build_combined_project.py                       # looks for the source file automatically
+    python build_combined_project.py path/to/original.py   # or pass it explicitly
+
+Output (in the current folder):
+    combined_surface_inspection/            app.py, serial_uploader.py,
+                                            arduino_height_sensor.ino,
+                                            requirements.txt, README.md
+    combined_surface_inspection.zip
+"""
+import ast
+import sys
+import textwrap
+import zipfile
 from pathlib import Path
 
-# Writable storage for temporary files on Streamlit Cloud
-base = Path("/tmp/surface_defect_detection")
-base.mkdir(parents=True, exist_ok=True)
+# ------------------------------------------------------------------
+# 0. Locations (no hard-coded /mnt/data or /tmp paths)
+# ------------------------------------------------------------------
+OUT_DIR = Path.cwd() / "combined_surface_inspection"
+ZIP_PATH = Path.cwd() / "combined_surface_inspection.zip"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def find_source() -> Path:
+    """Find the original single-page AI app source."""
+    if len(sys.argv) > 1:
+        return Path(sys.argv[1])
+    candidates = [
+        Path.cwd() / "Pasted text(2).txt",
+        Path.cwd() / "original_app.py",
+        Path.cwd() / "app_original.py",
+        Path("/mnt/data/Pasted text(2).txt"),
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    raise SystemExit(
+        "Original source file not found. Put it in this folder as "
+        "'original_app.py' or run:\n"
+        "    python build_combined_project.py path/to/your_original_app.py"
+    )
 
-source_path = Path("/mnt/data/Pasted text(2).txt")
-source = source_path.read_text(encoding="utf-8")
 
-# Keep original imports and model/checkpoint helper functions, but rebuild page routing.
-helper_end = source.index("# ============================================================\n# 8. MODEL INFORMATION")
-helpers = source[:helper_end]
+def find_marker(text: str, marker: str) -> int:
+    """str.index with a readable error message."""
+    pos = text.find(marker)
+    if pos == -1:
+        raise SystemExit(
+            "Section marker not found in the original source:\n"
+            f"{marker!r}\n"
+            "Make sure the original file still has its '# ====' section headers."
+        )
+    return pos
 
-# Remove the original page config and title/caption, as combined app adds its own header.
-page_start = helpers.index("# ============================================================\n# 2. STREAMLIT PAGE CONFIGURATION")
-hf_start = helpers.index("# ============================================================\n# 3. HUGGING FACE TOKEN")
-helpers = helpers[:page_start] + helpers[hf_start:]
 
-# Ensure requests imported; REST calls are used in main app.
-helpers = helpers.replace("import torch\n", "import torch\nimport requests\n")
+SEP = "# ============================================================\n"
+source = find_source().read_text(encoding="utf-8")
 
-ai_body = source[source.index("# ============================================================\n# 8. MODEL INFORMATION"):]
+# ------------------------------------------------------------------
+# 1. Split the original file into pieces
+#       head     : imports (section 1)
+#       (removed): original page config + title (section 2)
+#       helpers  : HF token, checkpoints, model loading ... (sections 3-7)
+#       ai_body  : AI page UI (section 8 onward)
+# ------------------------------------------------------------------
+page_start = find_marker(source, SEP + "# 2. STREAMLIT PAGE CONFIGURATION")
+hf_start = find_marker(source, SEP + "# 3. HUGGING FACE TOKEN")
+ai_start = find_marker(source, SEP + "# 8. MODEL INFORMATION")
 
-# Indent the full existing AI section so it only runs when that page is selected.
-ai_indented = "\n".join(("    " + line if line else "") for line in ai_body.splitlines())
+head = source[:page_start]
+helpers = source[hf_start:ai_start]
+ai_body = source[ai_start:]
 
-app = helpers + textwrap.dedent('''
+# Extra imports go at the very top (after any __future__ import).
+extra_imports = "import requests\n"
+if head.lstrip().startswith("from __future__"):
+    first_nl = head.index("\n") + 1
+    head = head[:first_nl] + extra_imports + head[first_nl:]
+else:
+    head = extra_imports + head
 
+# Indent the AI section so it only runs when that page is selected.
+# (textwrap.indent skips blank lines automatically.)
+ai_indented = textwrap.indent(ai_body, "    ")
+
+# ------------------------------------------------------------------
+# 2. Templates
+# ------------------------------------------------------------------
+
+# FIX: set_page_config MUST be the first Streamlit call. In the original build
+# it was placed AFTER the helpers (which already call st.*), which raises
+# StreamlitAPIException. It now sits directly after the imports.
+PAGE_CONFIG = '''
 # ============================================================
-# COMBINED APP NAVIGATION
+# PAGE CONFIGURATION (must be the first Streamlit command)
 # ============================================================
-
 st.set_page_config(
     page_title="Surface Inspection & Object Height",
     page_icon="🔍",
     layout="wide",
 )
 
+'''
+
+COMBINED_NAV = '''
+
+# ============================================================
+# LIVE OBJECT HEIGHT HELPERS
+# ============================================================
+def _secret(*names, default=""):
+    """Read the first available Streamlit secret; never crash if secrets.toml is missing."""
+    for name in names:
+        try:
+            value = st.secrets[name]
+            if value:
+                return str(value)
+        except Exception:
+            continue
+    return default
+
+
+@st.cache_data(ttl=2, show_spinner=False)
+def fetch_latest_height():
+    """Read the newest sensor reading from the Supabase REST API."""
+    url = _secret("SUPABASE_URL").rstrip("/")
+    # Prefer the read-only anon key; fall back to the service-role key.
+    key = _secret("SUPABASE_ANON_KEY", "SUPABASE_SERVICE_ROLE_KEY")
+    if not url or not key:
+        return None, "Add SUPABASE_URL and SUPABASE_ANON_KEY in Streamlit Secrets."
+
+    endpoint = f"{url}/rest/v1/height_readings"
+    headers = {"apikey": key, "Authorization": f"Bearer {key}"}
+    params = {
+        "select": "object_height,created_at",
+        "order": "created_at.desc",
+        "limit": "1",
+    }
+    try:
+        response = requests.get(endpoint, headers=headers, params=params, timeout=8)
+        response.raise_for_status()
+        rows = response.json()
+        if not rows:
+            return None, "No sensor readings yet. Start serial_uploader.py on the laptop."
+        return rows[0], None
+    except Exception as exc:
+        return None, f"Could not read the latest sensor value: {exc}"
+
+
+@st.fragment(run_every=2)
+def live_height_panel():
+    row, error = fetch_latest_height()
+    if error:
+        st.info(error)
+        return
+    try:
+        height = float(row["object_height"])
+        st.metric("OBJECT HEIGHT", f"{height:.1f} cm")
+        st.caption(f"Last update (UTC): {row.get('created_at', 'unknown')}")
+    except (KeyError, TypeError, ValueError):
+        st.warning("The latest database row has an invalid height value.")
+
+
+# ============================================================
+# COMBINED APP NAVIGATION
+# ============================================================
 st.title("🔍 Surface Inspection & Object Height")
 st.caption("AI steel-surface inspection plus live Arduino HC-SR04 height measurement.")
 
@@ -50,49 +178,7 @@ page = st.sidebar.radio(
 if page == "Live Object Height":
     st.header("Live Object Height")
     st.caption("The laptop-side serial bridge sends filtered sensor readings to the cloud database.")
-
-    @st.cache_data(ttl=2, show_spinner=False)
-    def fetch_latest_height():
-        """Read the newest sensor reading from Supabase REST API."""
-        url = st.secrets.get("SUPABASE_URL", "").rstrip("/")
-        key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
-        if not url or not key:
-            return None, "Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets."
-        endpoint = f"{url}/rest/v1/height_readings"
-        headers = {
-            "apikey": key,
-            "Authorization": f"Bearer {key}",
-        }
-        params = {
-            "select": "object_height,created_at",
-            "order": "created_at.desc",
-            "limit": "1",
-        }
-        try:
-            response = requests.get(endpoint, headers=headers, params=params, timeout=8)
-            response.raise_for_status()
-            rows = response.json()
-            if not rows:
-                return None, "No sensor readings have arrived yet. Start serial_uploader.py on the laptop."
-            return rows[0], None
-        except Exception as exc:
-            return None, f"Could not read the latest sensor value: {exc}"
-
-    @st.fragment(run_every=2)
-    def live_height_panel():
-        row, error = fetch_latest_height()
-        if error:
-            st.info(error)
-            return
-        try:
-            height = float(row["object_height"])
-            st.metric("OBJECT HEIGHT", f"{height:.1f} cm")
-            st.caption(f"Last update (UTC): {row.get('created_at', 'unknown')}")
-        except (KeyError, TypeError, ValueError):
-            st.warning("The latest database row has an invalid height value.")
-
     live_height_panel()
-
     st.markdown(
         "Keep the Arduino connected to the laptop and keep **serial_uploader.py** running. "
         "The hosted website cannot read the laptop's COM port directly; the uploader sends "
@@ -100,11 +186,9 @@ if page == "Live Object Height":
     )
 
 elif page == "AI Surface Defect Detection":
-''') + ai_indented + "\n"
+'''
 
-(base / "app.py").write_text(app, encoding="utf-8")
-
-uploader = r'''"""
+UPLOADER = r'''"""
 Read filtered object-height lines from the Arduino serial port and send
 the latest reading to Supabase for the hosted Streamlit app.
 
@@ -120,17 +204,18 @@ import requests
 import serial
 from serial.tools import list_ports
 
-# Set these environment variables before running, or edit the values here.
 SERIAL_PORT = os.getenv("ARDUINO_PORT", "COM3")
 BAUD_RATE = 9600
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 TABLE = "height_readings"
+MIN_INTERVAL_S = 0.5  # at most 2 uploads per second
 
 HEIGHT_PATTERN = re.compile(
     r"Object Height:\s*(-?\d+(?:\.\d+)?)\s*cm",
     re.IGNORECASE,
 )
+
 
 def main():
     if not SUPABASE_URL or not SUPABASE_KEY:
@@ -154,7 +239,7 @@ def main():
 
     try:
         with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1) as arduino:
-            time.sleep(2)  # Arduino may reset when serial opens.
+            time.sleep(2)  # Arduino resets when the port opens
             arduino.reset_input_buffer()
             print("Connected. Sending filtered height readings. Press Ctrl+C to stop.")
 
@@ -168,27 +253,20 @@ def main():
                 if not match:
                     continue
 
-                height = max(0.0, float(match.group(1)))
                 now = time.monotonic()
-
-                # Limit uploads to at most 2 readings per second.
-                if now - last_sent < 0.5:
+                if now - last_sent < MIN_INTERVAL_S:
                     continue
+                last_sent = now  # set before the request so failures don't cause a retry storm
 
+                height = max(0.0, float(match.group(1)))
                 payload = {
                     "object_height": round(height, 1),
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
                 try:
-                    response = requests.post(
-                        endpoint,
-                        headers=headers,
-                        json=payload,
-                        timeout=10,
-                    )
+                    response = requests.post(endpoint, headers=headers, json=payload, timeout=10)
                     response.raise_for_status()
                     print(f"Uploaded object height: {height:.1f} cm")
-                    last_sent = now
                 except requests.RequestException as exc:
                     print(f"Upload failed: {exc}")
 
@@ -197,13 +275,15 @@ def main():
             f"Could not open {SERIAL_PORT}: {exc}\n"
             "Close Arduino Serial Monitor and verify Tools > Port in Arduino IDE."
         )
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+
 
 if __name__ == "__main__":
     main()
 '''
-(base / "serial_uploader.py").write_text(uploader, encoding="utf-8")
 
-arduino = r'''/*
+ARDUINO = r'''/*
   HC-SR04 object height measurement with median filtering + smoothing.
   Sensor-to-ground reference height: 15.0 cm
   TRIG -> D9, ECHO -> D10, VCC -> 5V, GND -> GND
@@ -300,9 +380,8 @@ void loop() {
   delay(100);
 }
 '''
-(base / "arduino_height_sensor.ino").write_text(arduino, encoding="utf-8")
 
-requirements = """streamlit>=1.37
+REQUIREMENTS = """streamlit>=1.37
 numpy
 matplotlib
 Pillow
@@ -313,32 +392,31 @@ huggingface_hub
 requests
 pyserial
 """
-(base / "requirements.txt").write_text(requirements, encoding="utf-8")
 
-readme = r'''# Combined Surface Defect Detection + Live Object Height
+README = r'''# Combined Surface Defect Detection + Live Object Height
 
-This project combines:
 - YOLO + PatchCore steel-surface defect inspection.
 - Live HC-SR04 object-height display.
 - A laptop-side serial uploader that forwards Arduino readings to Supabase.
 - A Streamlit Cloud app that reads the newest value from Supabase.
 
-## Important architecture note
+## Architecture note
 
-Streamlit Cloud cannot directly access a USB/COM port on your laptop. Keep `serial_uploader.py` running on the laptop; it reads the Arduino and posts measurements to Supabase. The hosted app polls Supabase every 2 seconds.
+Streamlit Cloud cannot access a USB/COM port on your laptop. Keep `serial_uploader.py`
+running on the laptop; it reads the Arduino and posts measurements to Supabase.
+The hosted app polls Supabase every 2 seconds.
 
-## 1. Reduce sensor fluctuations
+## 1. Arduino
 
 1. Upload `arduino_height_sensor.ino` to the Uno.
-2. Confirm TRIG=D9, ECHO=D10, VCC=5V, GND=GND.
-3. Sensor-to-ground distance must be exactly 15 cm for this sketch.
-4. Keep the sensor perpendicular to the object. Use a flat, firm test object first.
-5. The sketch takes 9 samples, uses their median, and smooths the result. Increase stability by changing `SMOOTH_ALPHA` from `0.25` to `0.15`; response will be slower.
-6. If the conveyor object moves quickly, too much smoothing can make height lag behind the object.
+2. Wiring: TRIG=D9, ECHO=D10, VCC=5V, GND=GND.
+3. Sensor-to-ground distance must be exactly 15 cm (`REFERENCE_HEIGHT_CM`).
+4. Keep the sensor perpendicular to a flat, firm object.
+5. For steadier readings lower `SMOOTH_ALPHA` (0.25 -> 0.15); response becomes slower.
 
-## 2. Create the Supabase table
+## 2. Supabase table
 
-Create a Supabase project, open **SQL Editor**, and run:
+Run in **SQL Editor**:
 
 ```sql
 create table public.height_readings (
@@ -349,78 +427,84 @@ create table public.height_readings (
 
 alter table public.height_readings enable row level security;
 
-create policy "service role can manage height readings"
+-- The website only needs to READ the newest value (anon key).
+create policy "anon can read height readings"
 on public.height_readings
-for all
-to service_role
-using (true)
-with check (true);
+for select
+to anon
+using (true);
+
+-- Writes come from the laptop uploader using the service-role key (bypasses RLS).
 ```
 
-Use the **Project URL** and **service_role/secret key** from Supabase project API settings. Never publish the service-role key in GitHub, source code, screenshots, or a public message. The service-role key bypasses RLS; keep it only in local environment variables and Streamlit Cloud Secrets.
+Never put the service-role key in GitHub, the Streamlit app, screenshots or messages.
 
-## 3. Configure the Streamlit Cloud app
-
-In the Streamlit Cloud app's **Settings → Secrets**, add:
+## 3. Streamlit Cloud secrets (Settings -> Secrets)
 
 ```toml
 SUPABASE_URL = "https://YOUR_PROJECT_ID.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY = "YOUR_SUPABASE_SERVICE_ROLE_KEY"
+SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_PUBLIC_KEY"
 ```
 
-Do not commit secrets to GitHub.
+## 4. Laptop uploader (Windows)
 
-## 4. Configure the laptop uploader on Windows
-
-Close Arduino IDE Serial Monitor first. Open Command Prompt in this project folder and install uploader dependencies:
+Close Arduino Serial Monitor first, then:
 
 ```bat
 python -m pip install pyserial requests
-```
-
-Set environment variables in that same Command Prompt (replace placeholders):
-
-```bat
 set SUPABASE_URL=https://YOUR_PROJECT_ID.supabase.co
 set SUPABASE_SERVICE_ROLE_KEY=YOUR_SUPABASE_SERVICE_ROLE_KEY
 set ARDUINO_PORT=COM3
 python serial_uploader.py
 ```
 
-Change `COM3` if Arduino IDE → Tools → Port shows another port. Keep this terminal open while you need live data online.
+## 5. Deploy
 
-## 5. Deploy the combined app
-
-1. Upload `app.py`, `requirements.txt`, and the other project files to your existing GitHub repository.
-2. On Streamlit Community Cloud, set the app's main file to `app.py` (or edit the existing app's main file setting).
-3. Add the Supabase secrets described above.
-4. Reboot the app after dependencies and secrets are set.
-5. Open **Live Object Height** in the sidebar. The displayed value updates approximately every 2 seconds.
-6. Choose **AI Surface Defect Detection** for the existing upload-based YOLO and PatchCore workflow.
+1. Push `app.py`, `requirements.txt` and the other files to GitHub.
+2. In Streamlit Community Cloud set the main file to `app.py`.
+3. Add the secrets and reboot the app.
 
 ## Troubleshooting
 
-- **No sensor readings:** check `ARDUINO_PORT`, close Serial Monitor, and check the uploader terminal.
-- **Supabase 401/403:** verify the URL/key and that the key is the service-role/secret key.
-- **No row appears:** inspect the uploader output for upload errors and verify the table name.
-- **Cloud build fails:** AI dependencies such as PyTorch/anomalib are large and version-sensitive. Review Streamlit Cloud logs; pin compatible versions if needed.
-- **High fluctuation remains:** secure the sensor, keep the surface perpendicular, avoid measuring edges/angled/soft surfaces, and verify the empty-ground distance is consistently about 15 cm.
-
-This is a demonstration setup. A service-role key has broad database permissions; for production, replace it with a narrowly scoped authenticated endpoint or Edge Function.
+- **No sensor readings:** check `ARDUINO_PORT`, close Serial Monitor, read the uploader output.
+- **Supabase 401/403:** check URL/key and that the SELECT policy for `anon` exists.
+- **Cloud build fails:** PyTorch/anomalib are large and version-sensitive; pin versions from the logs.
+- **Height page blocked by the AI section:** if the original code calls `st.stop()` at module level
+  (e.g. missing Hugging Face token), it stops the whole app, including the height page.
 '''
-(base / "README.md").write_text(readme, encoding="utf-8")
 
-# Basic syntax check on app and uploader.
-import ast
-ast.parse((base / "app.py").read_text(encoding="utf-8"))
-ast.parse((base / "serial_uploader.py").read_text(encoding="utf-8"))
+# ------------------------------------------------------------------
+# 3. Assemble app.py
+# ------------------------------------------------------------------
+app = head + PAGE_CONFIG + helpers + COMBINED_NAV + ai_indented + "\n"
 
-zip_path = Path("/mnt/data/combined_surface_inspection.zip")
-with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-    for p in base.iterdir():
+files = {
+    "app.py": app,
+    "serial_uploader.py": UPLOADER,
+    "arduino_height_sensor.ino": ARDUINO,
+    "requirements.txt": REQUIREMENTS,
+    "README.md": README,
+}
+for name, content in files.items():
+    (OUT_DIR / name).write_text(content, encoding="utf-8")
+
+# ------------------------------------------------------------------
+# 4. Syntax check (fails loudly instead of shipping a broken app)
+# ------------------------------------------------------------------
+for name in ("app.py", "serial_uploader.py"):
+    try:
+        ast.parse((OUT_DIR / name).read_text(encoding="utf-8"), filename=name)
+    except SyntaxError as exc:
+        raise SystemExit(f"Syntax error in generated {name}: {exc}")
+
+# ------------------------------------------------------------------
+# 5. Zip
+# ------------------------------------------------------------------
+with zipfile.ZipFile(ZIP_PATH, "w", zipfile.ZIP_DEFLATED) as zf:
+    for p in sorted(OUT_DIR.iterdir()):
         zf.write(p, arcname=f"combined_surface_inspection/{p.name}")
 
 print("Created project files:")
-for p in sorted(base.iterdir()):
-    print(f"{p.name}: {p.stat().st_size:,} bytes")
-print(f"ZIP: {zip_path} ({zip_path.stat().st_size:,} bytes)")
+for p in sorted(OUT_DIR.iterdir()):
+    print(f"  {p.name}: {p.stat().st_size:,} bytes")
+print(f"ZIP: {ZIP_PATH} ({ZIP_PATH.stat().st_size:,} bytes)")
