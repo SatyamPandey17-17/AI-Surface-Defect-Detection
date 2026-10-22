@@ -83,9 +83,9 @@ if head.lstrip().startswith("from __future__"):
 else:
     head = extra_imports + head
 
-# Indent the AI section so it only runs when that page is selected.
-# (textwrap.indent skips blank lines automatically.)
-ai_indented = textwrap.indent(ai_body, "    ")
+# NOTE: the AI code is NOT merged into app.py any more. It is written to its own
+# file (ai_page.py) and loaded by st.navigation only when that page is opened,
+# so torch / anomalib / ultralytics are not imported for the Live Height page.
 
 # ------------------------------------------------------------------
 # 2. Templates
@@ -167,15 +167,8 @@ def live_height_panel():
 # ============================================================
 # COMBINED APP NAVIGATION
 # ============================================================
-st.title("🔍 Surface Inspection & Object Height")
-st.caption("AI steel-surface inspection plus live Arduino HC-SR04 height measurement.")
-
-page = st.sidebar.radio(
-    "Choose project module",
-    ["Live Object Height", "AI Surface Defect Detection"],
-)
-
-if page == "Live Object Height":
+def height_page():
+    st.title("🔍 Surface Inspection & Object Height")
     st.header("Live Object Height")
     st.caption("The laptop-side serial bridge sends filtered sensor readings to the cloud database.")
     live_height_panel()
@@ -185,7 +178,16 @@ if page == "Live Object Height":
         "readings through Supabase."
     )
 
-elif page == "AI Surface Defect Detection":
+
+# Streamlit only executes the selected page, so the heavy AI script
+# (torch, anomalib, ultralytics, model downloads) runs ONLY on the AI page.
+navigation = st.navigation(
+    [
+        st.Page(height_page, title="Live Object Height", icon="📏", default=True),
+        st.Page("ai_page.py", title="AI Surface Defect Detection", icon="🧠"),
+    ]
+)
+navigation.run()
 '''
 
 UPLOADER = r'''"""
@@ -476,10 +478,22 @@ python serial_uploader.py
 # ------------------------------------------------------------------
 # 3. Assemble app.py
 # ------------------------------------------------------------------
-app = head + PAGE_CONFIG + helpers + COMBINED_NAV + ai_indented + "\n"
+# Light entry file: only streamlit + requests are imported here.
+app = "import streamlit as st\nimport requests\n" + PAGE_CONFIG + COMBINED_NAV
+
+# Heavy AI page: original imports + helpers + AI UI, untouched (no indenting needed).
+# Page config is already set in app.py, so it is not repeated here.
+ai_page = (
+    head
+    + '\nst.title("🧠 AI Surface Defect Detection")\n\n'
+    + helpers
+    + ai_body
+    + "\n"
+)
 
 files = {
     "app.py": app,
+    "ai_page.py": ai_page,
     "serial_uploader.py": UPLOADER,
     "arduino_height_sensor.ino": ARDUINO,
     "requirements.txt": REQUIREMENTS,
@@ -491,7 +505,7 @@ for name, content in files.items():
 # ------------------------------------------------------------------
 # 4. Syntax check (fails loudly instead of shipping a broken app)
 # ------------------------------------------------------------------
-for name in ("app.py", "serial_uploader.py"):
+for name in ("app.py", "ai_page.py", "serial_uploader.py"):
     try:
         ast.parse((OUT_DIR / name).read_text(encoding="utf-8"), filename=name)
     except SyntaxError as exc:
