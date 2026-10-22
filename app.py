@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import requests
 import streamlit as st
 
@@ -80,10 +82,20 @@ def height_page():
 
 # Streamlit only executes the selected page, so the heavy AI script
 # (torch, anomalib, ultralytics) runs ONLY when the AI page is opened.
-navigation = st.navigation(
-    [
-        st.Page(height_page, title="Live Object Height", icon="📏", default=True),
-        st.Page("ai_page.py", title="AI Surface Defect Detection", icon="🧠"),
-    ]
-)
+def ai_missing_page():
+    st.title("🧠 AI Surface Defect Detection")
+    st.warning(
+        "ai_page.py was not found in the GitHub repository. Upload it next to "
+        "app.py (same folder, exact lowercase name) and reboot the app."
+    )
+
+
+pages = [st.Page(height_page, title="Live Object Height", icon="📏", default=True)]
+
+if (Path(__file__).parent / "ai_page.py").exists():
+    pages.append(st.Page("ai_page.py", title="AI Surface Defect Detection", icon="🧠"))
+else:
+    pages.append(st.Page(ai_missing_page, title="AI Surface Defect Detection", icon="🧠"))
+
+navigation = st.navigation(pages)
 navigation.run()
