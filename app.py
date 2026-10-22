@@ -1,8 +1,10 @@
-from pathlib import Path
-import re, shutil, zipfile, textwrap
 
-base = Path("/mnt/data/combined_surface_inspection")
+from pathlib import Path
+
+# Writable storage for temporary files on Streamlit Cloud
+base = Path("/tmp/surface_defect_detection")
 base.mkdir(parents=True, exist_ok=True)
+
 
 
 source_path = Path("/mnt/data/Pasted text(2).txt")
