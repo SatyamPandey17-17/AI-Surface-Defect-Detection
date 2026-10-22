@@ -2,7 +2,8 @@ from pathlib import Path
 import re, shutil, zipfile, textwrap
 
 base = Path("/mnt/data/combined_surface_inspection")
-base.mkdir(exist_ok=True)
+base.mkdir(parents=True, exist_ok=True)
+
 
 source_path = Path("/mnt/data/Pasted text(2).txt")
 source = source_path.read_text(encoding="utf-8")
