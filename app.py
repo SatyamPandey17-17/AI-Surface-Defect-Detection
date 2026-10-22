@@ -1,669 +1,423 @@
-
 from pathlib import Path
-import os
-import shutil
-import tempfile
+import re, shutil, zipfile, textwrap
 
-import streamlit as st
-import numpy as np
-import matplotlib.pyplot as plt
-from PIL import Image
-import torch
+base = Path("/mnt/data/combined_surface_inspection")
+base.mkdir(exist_ok=True)
 
-from anomalib.data import PredictDataset
-from anomalib.models import Patchcore
-from anomalib.engine import Engine
-from ultralytics import YOLO
-from huggingface_hub import hf_hub_download
+source_path = Path("/mnt/data/Pasted text(2).txt")
+source = source_path.read_text(encoding="utf-8")
 
+# Keep original imports and model/checkpoint helper functions, but rebuild page routing.
+helper_end = source.index("# ============================================================\n# 8. MODEL INFORMATION")
+helpers = source[:helper_end]
 
-# ============================================================
-# 1. PATHS AND MODEL CONFIGURATION
-# ============================================================
+# Remove the original page config and title/caption, as combined app adds its own header.
+page_start = helpers.index("# ============================================================\n# 2. STREAMLIT PAGE CONFIGURATION")
+hf_start = helpers.index("# ============================================================\n# 3. HUGGING FACE TOKEN")
+helpers = helpers[:page_start] + helpers[hf_start:]
 
-PROJECT_DIR = Path(__file__).resolve().parent
+# Ensure requests imported; REST calls are used in main app.
+helpers = helpers.replace("import torch\n", "import torch\nimport requests\n")
 
-HF_REPO_ID = "satyam17-17/surface-defect-patchcore"
+ai_body = source[source.index("# ============================================================\n# 8. MODEL INFORMATION"):]
 
-PATCHCORE_FILENAME = "model.ckpt"
-YOLO_FILENAME = "best.pt"
+# Indent the full existing AI section so it only runs when that page is selected.
+ai_indented = "\n".join(("    " + line if line else "") for line in ai_body.splitlines())
 
-PATCHCORE_CHECKPOINT = PROJECT_DIR / "model.ckpt"
-CPU_CHECKPOINT = PROJECT_DIR / "model_cpu.ckpt"
-
-# Optional local YOLO checkpoint.
-YOLO_MODEL_PATH = PROJECT_DIR / "best.pt"
-
-# Hugging Face repository containing both model files.
-YOLO_REPO_ID = HF_REPO_ID
-
+app = helpers + textwrap.dedent('''
 
 # ============================================================
-# 2. STREAMLIT PAGE CONFIGURATION
+# COMBINED APP NAVIGATION
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Surface Defect Detection",
+    page_title="Surface Inspection & Object Height",
     page_icon="🔍",
     layout="wide",
 )
 
-st.title("🔍 AI Surface Defect Detection")
+st.title("🔍 Surface Inspection & Object Height")
+st.caption("AI steel-surface inspection plus live Arduino HC-SR04 height measurement.")
 
-st.caption(
-    "AI-powered steel surface inspection using "
-    "PatchCore anomaly detection and YOLO defect detection."
+page = st.sidebar.radio(
+    "Choose project module",
+    ["Live Object Height", "AI Surface Defect Detection"],
 )
 
+if page == "Live Object Height":
+    st.header("Live Object Height")
+    st.caption("The laptop-side serial bridge sends filtered sensor readings to the cloud database.")
 
-# ============================================================
-# 3. HUGGING FACE TOKEN
-# ============================================================
+    @st.cache_data(ttl=2, show_spinner=False)
+    def fetch_latest_height():
+        """Read the newest sensor reading from Supabase REST API."""
+        url = st.secrets.get("SUPABASE_URL", "").rstrip("/")
+        key = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", "")
+        if not url or not key:
+            return None, "Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets."
+        endpoint = f"{url}/rest/v1/height_readings"
+        headers = {
+            "apikey": key,
+            "Authorization": f"Bearer {key}",
+        }
+        params = {
+            "select": "object_height,created_at",
+            "order": "created_at.desc",
+            "limit": "1",
+        }
+        try:
+            response = requests.get(endpoint, headers=headers, params=params, timeout=8)
+            response.raise_for_status()
+            rows = response.json()
+            if not rows:
+                return None, "No sensor readings have arrived yet. Start serial_uploader.py on the laptop."
+            return rows[0], None
+        except Exception as exc:
+            return None, f"Could not read the latest sensor value: {exc}"
 
-def get_hf_token():
-    """Read the optional Hugging Face token."""
+    @st.fragment(run_every=2)
+    def live_height_panel():
+        row, error = fetch_latest_height()
+        if error:
+            st.info(error)
+            return
+        try:
+            height = float(row["object_height"])
+            st.metric("OBJECT HEIGHT", f"{height:.1f} cm")
+            st.caption(f"Last update (UTC): {row.get('created_at', 'unknown')}")
+        except (KeyError, TypeError, ValueError):
+            st.warning("The latest database row has an invalid height value.")
+
+    live_height_panel()
+
+    st.markdown(
+        "Keep the Arduino connected to the laptop and keep **serial_uploader.py** running. "
+        "The hosted website cannot read the laptop's COM port directly; the uploader sends "
+        "readings through Supabase."
+    )
+
+elif page == "AI Surface Defect Detection":
+''') + ai_indented + "\n"
+
+(base / "app.py").write_text(app, encoding="utf-8")
+
+uploader = r'''"""
+Read filtered object-height lines from the Arduino serial port and send
+the latest reading to Supabase for the hosted Streamlit app.
+
+Install: python -m pip install pyserial requests
+Run:     python serial_uploader.py
+"""
+import os
+import re
+import time
+from datetime import datetime, timezone
+
+import requests
+import serial
+from serial.tools import list_ports
+
+# Set these environment variables before running, or edit the values here.
+SERIAL_PORT = os.getenv("ARDUINO_PORT", "COM3")
+BAUD_RATE = 9600
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+TABLE = "height_readings"
+
+HEIGHT_PATTERN = re.compile(
+    r"Object Height:\s*(-?\d+(?:\.\d+)?)\s*cm",
+    re.IGNORECASE,
+)
+
+def main():
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise SystemExit(
+            "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables."
+        )
+
+    print("Available serial ports:")
+    for port in list_ports.comports():
+        print(f"  {port.device}: {port.description}")
+
+    print(f"\nConnecting to Arduino on {SERIAL_PORT} at {BAUD_RATE} baud...")
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    endpoint = f"{SUPABASE_URL}/rest/v1/{TABLE}"
+    last_sent = 0.0
 
     try:
-        token = st.secrets.get("HF_TOKEN", None)
-        if token:
-            return token
-    except Exception:
-        pass
-
-    return os.environ.get("HF_TOKEN")
-
-
-# ============================================================
-# 4. DOWNLOAD PATCHCORE CHECKPOINT
-# ============================================================
-
-@st.cache_resource(show_spinner=False)
-def ensure_patchcore_checkpoint():
-
-    if (
-        PATCHCORE_CHECKPOINT.is_file()
-        and PATCHCORE_CHECKPOINT.stat().st_size > 0
-    ):
-        return str(PATCHCORE_CHECKPOINT)
-
-    token = get_hf_token()
-
-    downloaded_path = hf_hub_download(
-        repo_id=HF_REPO_ID,
-        filename=PATCHCORE_FILENAME,
-        repo_type="model",
-        token=token,
-    )
-
-    temporary_path = PROJECT_DIR / "model_download.tmp"
-
-    try:
-        shutil.copyfile(downloaded_path, temporary_path)
-
-        if (
-            not temporary_path.is_file()
-            or temporary_path.stat().st_size == 0
-        ):
-            raise RuntimeError(
-                "The downloaded PatchCore checkpoint is empty."
-            )
-
-        os.replace(temporary_path, PATCHCORE_CHECKPOINT)
-
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-
-    return str(PATCHCORE_CHECKPOINT)
-
-
-# ============================================================
-# 5. PREPARE PATCHCORE CHECKPOINT FOR CPU
-# ============================================================
-
-@st.cache_resource(show_spinner=False)
-def make_cpu_checkpoint(checkpoint_path):
-
-    source = Path(checkpoint_path)
-
-    if not source.is_file():
-        raise FileNotFoundError(
-            f"PatchCore checkpoint not found: {source}"
-        )
-
-    if (
-        CPU_CHECKPOINT.is_file()
-        and CPU_CHECKPOINT.stat().st_size > 0
-        and CPU_CHECKPOINT.stat().st_mtime >= source.stat().st_mtime
-    ):
-        return str(CPU_CHECKPOINT)
-
-    temporary_path = PROJECT_DIR / "model_cpu.tmp"
-
-    try:
-        # Use only a checkpoint from your trusted model repository.
-        checkpoint = torch.load(
-            str(source),
-            map_location=torch.device("cpu"),
-            weights_only=False,
-        )
-
-        torch.save(checkpoint, str(temporary_path))
-
-        if (
-            not temporary_path.is_file()
-            or temporary_path.stat().st_size == 0
-        ):
-            raise RuntimeError(
-                "CPU checkpoint conversion produced an empty file."
-            )
-
-        os.replace(temporary_path, CPU_CHECKPOINT)
-
-    finally:
-        if temporary_path.exists():
-            temporary_path.unlink()
-
-    return str(CPU_CHECKPOINT)
-
-
-# ============================================================
-# 6. DOWNLOAD YOLO CHECKPOINT
-# ============================================================
-
-@st.cache_resource(show_spinner=False)
-def ensure_yolo_checkpoint():
-
-    # Use a local checkpoint if one has been included in deployment.
-    if (
-        YOLO_MODEL_PATH.is_file()
-        and YOLO_MODEL_PATH.stat().st_size > 0
-    ):
-        return str(YOLO_MODEL_PATH)
-
-    # Otherwise download best.pt from Hugging Face.
-    token = get_hf_token()
-
-    downloaded_path = hf_hub_download(
-        repo_id=YOLO_REPO_ID,
-        filename=YOLO_FILENAME,
-        repo_type="model",
-        token=token,
-    )
-
-    if not Path(downloaded_path).is_file():
-        raise FileNotFoundError(
-            "Hugging Face did not return a valid YOLO checkpoint."
-        )
-
-    if Path(downloaded_path).stat().st_size == 0:
-        raise RuntimeError("The downloaded YOLO checkpoint is empty.")
-
-    return str(downloaded_path)
-
-
-# ============================================================
-# 7. LOAD MODELS
-# ============================================================
-
-@st.cache_resource(show_spinner=False)
-def load_yolo_model(model_path):
-    return YOLO(str(model_path))
-
-
-@st.cache_resource(show_spinner=False)
-def load_patchcore_model():
-
-    model = Patchcore(
-        backbone="wide_resnet50_2",
-        pre_trained=True,
-    )
-
-    engine = Engine(
-        accelerator="cpu",
-        devices=1,
-    )
-
-    return model, engine
-
-
-# ============================================================
-# 8. MODEL INFORMATION
-# ============================================================
-
-with st.expander(
-    "Model status and supported defect classes",
-    expanded=False,
-):
-
-    st.write(
-        "**PatchCore:** Scratch-focused anomaly detection."
-    )
-
-    st.write(
-        "**YOLO classes:** Crazing, inclusion, patches, "
-        "pitted surface, rolled-in scale, and scratches."
-    )
-
-    st.write(
-        "**PatchCore checkpoint:** Downloaded from Hugging Face "
-        "when needed."
-    )
-
-    st.write(
-        "**YOLO checkpoint:** Downloaded from Hugging Face "
-        "when needed."
-    )
-
-    st.caption(
-        "The models work independently. PatchCore highlights unusual "
-        "regions, while YOLO predicts categories learned during "
-        "YOLO training."
-    )
-
-
-# ============================================================
-# 9. IMAGE UPLOAD
-# ============================================================
-
-uploaded_file = st.file_uploader(
-    "Upload a steel surface image",
-    type=["png", "jpg", "jpeg", "bmp"],
-)
-
-confidence_threshold = st.slider(
-    "YOLO confidence threshold",
-    min_value=0.05,
-    max_value=0.90,
-    value=0.15,
-    step=0.05,
-)
-
-if uploaded_file is None:
-    st.info("Upload an image to begin inspection.")
-    st.stop()
-
-try:
-    image = Image.open(uploaded_file).convert("RGB")
-
-except Exception as exc:
-    st.error(f"Unable to open the uploaded image: {exc}")
-    st.stop()
-
-st.subheader("Original image")
-
-st.image(
-    image,
-    use_container_width=True,
-)
-
-
-# ============================================================
-# 10. INSPECTION BUTTON
-# ============================================================
-
-if not st.button("Inspect surface", type="primary"):
-    st.stop()
-
-
-# ============================================================
-# 11. YOLO DEFECT DETECTION
-# ============================================================
-
-st.header("1. YOLO defect detection")
-
-try:
-
-    with st.spinner("Downloading and loading YOLO model..."):
-
-        yolo_checkpoint = ensure_yolo_checkpoint()
-        yolo_model = load_yolo_model(yolo_checkpoint)
-
-    with st.spinner("Running YOLO defect detection..."):
-
-        yolo_results = yolo_model.predict(
-            source=np.asarray(image),
-            imgsz=320,
-            conf=confidence_threshold,
-            device="cpu",
-            verbose=False,
-        )
-
-    result = yolo_results[0]
-
-    # Ultralytics plot output is BGR. Convert to RGB.
-    annotated = result.plot()
-    annotated = Image.fromarray(
-        annotated[:, :, ::-1].copy()
-    )
-
-    st.image(
-        annotated,
-        caption="YOLO bounding-box predictions",
-        use_container_width=True,
-    )
-
-    boxes = result.boxes
-
-    if boxes is not None and len(boxes) > 0:
-
-        rows = []
-
-        for box in boxes:
-
-            class_id = int(box.cls.item())
-            confidence = float(box.conf.item())
-
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-            rows.append(
-                {
-                    "Defect type": result.names.get(
-                        class_id,
-                        str(class_id),
-                    ),
-                    "Confidence": f"{confidence * 100:.1f}%",
-                    "X1": round(x1, 1),
-                    "Y1": round(y1, 1),
-                    "X2": round(x2, 1),
-                    "Y2": round(y2, 1),
+        with serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1) as arduino:
+            time.sleep(2)  # Arduino may reset when serial opens.
+            arduino.reset_input_buffer()
+            print("Connected. Sending filtered height readings. Press Ctrl+C to stop.")
+
+            while True:
+                line = arduino.readline().decode("utf-8", errors="ignore").strip()
+                if not line:
+                    continue
+                print("Arduino:", line)
+
+                match = HEIGHT_PATTERN.search(line)
+                if not match:
+                    continue
+
+                height = max(0.0, float(match.group(1)))
+                now = time.monotonic()
+
+                # Limit uploads to at most 2 readings per second.
+                if now - last_sent < 0.5:
+                    continue
+
+                payload = {
+                    "object_height": round(height, 1),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
                 }
-            )
+                try:
+                    response = requests.post(
+                        endpoint,
+                        headers=headers,
+                        json=payload,
+                        timeout=10,
+                    )
+                    response.raise_for_status()
+                    print(f"Uploaded object height: {height:.1f} cm")
+                    last_sent = now
+                except requests.RequestException as exc:
+                    print(f"Upload failed: {exc}")
 
-        st.success(
-            f"YOLO detected {len(rows)} object(s)."
+    except serial.SerialException as exc:
+        raise SystemExit(
+            f"Could not open {SERIAL_PORT}: {exc}\n"
+            "Close Arduino Serial Monitor and verify Tools > Port in Arduino IDE."
         )
 
-        st.dataframe(
-            rows,
-            use_container_width=True,
-            hide_index=True,
-        )
+if __name__ == "__main__":
+    main()
+'''
+(base / "serial_uploader.py").write_text(uploader, encoding="utf-8")
+
+arduino = r'''/*
+  HC-SR04 object height measurement with median filtering + smoothing.
+  Sensor-to-ground reference height: 15.0 cm
+  TRIG -> D9, ECHO -> D10, VCC -> 5V, GND -> GND
+
+  Serial output stays compatible with serial_uploader.py:
+  Distance: 9.0 cm | Object Height: 6.0 cm
+*/
+
+const byte TRIG_PIN = 9;
+const byte ECHO_PIN = 10;
+const float REFERENCE_HEIGHT_CM = 15.0;
+
+const byte SAMPLE_COUNT = 9;
+const unsigned long ECHO_TIMEOUT_US = 25000UL;
+const float SMOOTH_ALPHA = 0.25;  // lower = steadier but slower response
+
+float smoothedDistance = -1.0;
+
+float readOneDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, ECHO_TIMEOUT_US);
+  if (duration == 0) return -1.0;
+
+  float distance = duration * 0.0343 / 2.0;
+  if (distance < 2.0 || distance > 400.0) return -1.0;
+  return distance;
+}
+
+void sortValues(float values[], byte count) {
+  for (byte i = 0; i < count; i++) {
+    for (byte j = i + 1; j < count; j++) {
+      if (values[j] < values[i]) {
+        float temp = values[i];
+        values[i] = values[j];
+        values[j] = temp;
+      }
+    }
+  }
+}
+
+float readMedianDistanceCm() {
+  float samples[SAMPLE_COUNT];
+  byte validCount = 0;
+
+  for (byte i = 0; i < SAMPLE_COUNT; i++) {
+    float value = readOneDistanceCm();
+    if (value > 0) {
+      samples[validCount++] = value;
+    }
+    delay(35);  // avoid overlapping ultrasonic echoes
+  }
+
+  if (validCount == 0) return -1.0;
+  sortValues(samples, validCount);
+  return samples[validCount / 2];
+}
+
+void setup() {
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+  Serial.begin(9600);
+}
+
+void loop() {
+  float medianDistance = readMedianDistanceCm();
+
+  if (medianDistance > 0) {
+    if (smoothedDistance < 0) {
+      smoothedDistance = medianDistance;
+    } else {
+      smoothedDistance =
+        SMOOTH_ALPHA * medianDistance +
+        (1.0 - SMOOTH_ALPHA) * smoothedDistance;
+    }
+
+    float objectHeight = REFERENCE_HEIGHT_CM - smoothedDistance;
+    if (objectHeight < 0) objectHeight = 0;
+
+    Serial.print("Distance: ");
+    Serial.print(smoothedDistance, 1);
+    Serial.print(" cm | Object Height: ");
+    Serial.print(objectHeight, 1);
+    Serial.println(" cm");
+  } else {
+    Serial.println("No valid echo");
+  }
+
+  delay(100);
+}
+'''
+(base / "arduino_height_sensor.ino").write_text(arduino, encoding="utf-8")
 
-    else:
+requirements = """streamlit>=1.37
+numpy
+matplotlib
+Pillow
+torch
+anomalib
+ultralytics
+huggingface_hub
+requests
+pyserial
+"""
+(base / "requirements.txt").write_text(requirements, encoding="utf-8")
 
-        st.warning(
-            "YOLO did not detect a defect at the selected confidence "
-            "threshold. This does not prove the surface is defect-free."
-        )
+readme = r'''# Combined Surface Defect Detection + Live Object Height
 
-except Exception as exc:
+This project combines:
+- YOLO + PatchCore steel-surface defect inspection.
+- Live HC-SR04 object-height display.
+- A laptop-side serial uploader that forwards Arduino readings to Supabase.
+- A Streamlit Cloud app that reads the newest value from Supabase.
 
-    st.error(
-        f"YOLO model loading or detection failed: {exc}"
-    )
-
-    with st.expander("YOLO technical error"):
-        st.exception(exc)
-
-
-# ============================================================
-# 12. PATCHCORE ANOMALY INSPECTION
-# ============================================================
-
-st.header("2. PatchCore anomaly inspection")
-
-try:
-
-    # --------------------------------------------------------
-    # Download the trained checkpoint.
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Checking and downloading PatchCore checkpoint..."
-    ):
-
-        checkpoint_path = ensure_patchcore_checkpoint()
-
-    # --------------------------------------------------------
-    # Prepare a CPU-mapped checkpoint.
-    # --------------------------------------------------------
-
-    with st.spinner(
-        "Preparing CPU-compatible PatchCore checkpoint..."
-    ):
-
-        cpu_checkpoint_path = make_cpu_checkpoint(
-            checkpoint_path
-        )
-
-    # --------------------------------------------------------
-    # Run inference on the uploaded image.
-    # --------------------------------------------------------
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-
-        input_path = Path(temp_dir) / "input.png"
-
-        image.save(input_path, format="PNG")
-
-        with st.spinner(
-            "Calculating anomaly score and heatmap..."
-        ):
-
-            patchcore_model, engine = load_patchcore_model()
-
-            predictions = engine.predict(
-                model=patchcore_model,
-                dataset=PredictDataset(path=input_path),
-                ckpt_path=cpu_checkpoint_path,
-            )
-
-    if predictions is None or len(predictions) == 0:
-
-        st.warning("PatchCore returned no predictions.")
-        st.stop()
-
-    prediction = predictions[0]
-
-    anomaly_score = getattr(
-        prediction,
-        "pred_score",
-        None,
-    )
-
-    anomaly_map = getattr(
-        prediction,
-        "anomaly_map",
-        None,
-    )
-
-    pred_mask = getattr(
-        prediction,
-        "pred_mask",
-        None,
-    )
-
-
-    # ========================================================
-    # 13. ANOMALY SCORE
-    # ========================================================
-
-    st.subheader("Anomaly score")
-
-    if anomaly_score is not None:
-
-        if hasattr(anomaly_score, "detach"):
-            score_values = (
-                anomaly_score.detach().cpu().numpy()
-            )
-        else:
-            score_values = np.asarray(anomaly_score)
-
-        score_values = np.nan_to_num(
-            score_values.astype(np.float32),
-            nan=0.0,
-            posinf=0.0,
-            neginf=0.0,
-        )
-
-        score = float(
-            score_values.reshape(-1)[0]
-        )
-
-        st.metric(
-            label="PatchCore anomaly score",
-            value=f"{score:.4f}",
-        )
-
-        st.caption(
-            "Higher scores generally indicate greater anomaly intensity. "
-            "The score is not automatically a probability or a validated "
-            "defect/no-defect decision."
-        )
-
-    else:
-
-        st.warning(
-            "PatchCore did not return an anomaly score."
-        )
-
-
-    # ========================================================
-    # 14. ANOMALY HEATMAP AND OVERLAY
-    # ========================================================
-
-    st.subheader("Anomaly heatmap and overlay")
-
-    if anomaly_map is not None:
-
-        if hasattr(anomaly_map, "detach"):
-            heat = anomaly_map.detach().cpu().numpy()
-        else:
-            heat = np.asarray(anomaly_map)
-
-        heat = np.squeeze(heat)
-
-        if heat.ndim == 2 and heat.size > 0:
-
-            heat = np.nan_to_num(
-                heat.astype(np.float32),
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-
-            low = float(heat.min())
-            high = float(heat.max())
-
-            if high > low:
-                heat_norm = (heat - low) / (high - low)
-            else:
-                heat_norm = np.zeros_like(
-                    heat,
-                    dtype=np.float32,
-                )
-
-            # Resize heatmap to the original image dimensions.
-            heat_image = Image.fromarray(
-                (heat_norm * 255).astype(np.uint8)
-            ).resize(
-                image.size,
-                Image.Resampling.BILINEAR,
-            )
-
-            heat_norm = (
-                np.asarray(heat_image).astype(np.float32)
-                / 255.0
-            )
-
-            colored_heat = (
-                plt.get_cmap("jet")(heat_norm)[:, :, :3]
-                * 255
-            ).astype(np.uint8)
-
-            heat_rgb = Image.fromarray(colored_heat)
-
-            overlay = Image.blend(
-                image.convert("RGB"),
-                heat_rgb,
-                0.45,
-            )
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                st.image(
-                    heat_rgb,
-                    caption="Anomaly heatmap",
-                    use_container_width=True,
-                )
-
-            with col2:
-
-                st.image(
-                    overlay,
-                    caption="Heatmap overlay",
-                    use_container_width=True,
-                )
-
-            st.caption(
-                "Colors represent relative anomaly intensity within "
-                "this image. The heatmap is normalized for visualization."
-            )
-
-        else:
-
-            st.warning(
-                "PatchCore returned an invalid anomaly-map shape."
-            )
-
-    else:
-
-        st.info(
-            "PatchCore did not return an anomaly map."
-        )
-
-
-   
-
-    # ========================================================
-    # 16. FINAL INSPECTION SUMMARY
-    # ========================================================
-
-    st.divider()
-
-    st.subheader("Inspection summary")
-
-    st.write(
-        "- **PatchCore:** Highlights unusual surface regions using "
-        "the trained anomaly-detection checkpoint."
-    )
-
-    st.write(
-        "- **YOLO:** Detects and labels defects using its separately "
-        "trained checkpoint."
-    )
-
-    st.write(
-        "- **Important:** Both models can make mistakes. Their outputs "
-        "should be validated against labelled test images before "
-        "industrial use."
-    )
-
-except Exception as exc:
-
-    st.error(
-        "PatchCore inspection failed. Review the technical error below."
-    )
-
-    error_text = str(exc).lower()
-
-    if "401" in error_text or "403" in error_text:
-
-        st.warning(
-            "Hugging Face access may be denied. Confirm that the model "
-            "repository is public or configure HF_TOKEN in Streamlit "
-            "Cloud Secrets."
-        )
-
-    elif "cuda" in error_text:
-
-        st.warning(
-            "The checkpoint may contain device-specific tensors, "
-            "or a dependency may be attempting to use CUDA."
-        )
-
-    with st.expander("PatchCore technical error"):
-        st.exception(exc)
+## Important architecture note
+
+Streamlit Cloud cannot directly access a USB/COM port on your laptop. Keep `serial_uploader.py` running on the laptop; it reads the Arduino and posts measurements to Supabase. The hosted app polls Supabase every 2 seconds.
+
+## 1. Reduce sensor fluctuations
+
+1. Upload `arduino_height_sensor.ino` to the Uno.
+2. Confirm TRIG=D9, ECHO=D10, VCC=5V, GND=GND.
+3. Sensor-to-ground distance must be exactly 15 cm for this sketch.
+4. Keep the sensor perpendicular to the object. Use a flat, firm test object first.
+5. The sketch takes 9 samples, uses their median, and smooths the result. Increase stability by changing `SMOOTH_ALPHA` from `0.25` to `0.15`; response will be slower.
+6. If the conveyor object moves quickly, too much smoothing can make height lag behind the object.
+
+## 2. Create the Supabase table
+
+Create a Supabase project, open **SQL Editor**, and run:
+
+```sql
+create table public.height_readings (
+  id bigint generated by default as identity primary key,
+  object_height double precision not null,
+  created_at timestamptz not null default now()
+);
+
+alter table public.height_readings enable row level security;
+
+create policy "service role can manage height readings"
+on public.height_readings
+for all
+to service_role
+using (true)
+with check (true);
+```
+
+Use the **Project URL** and **service_role/secret key** from Supabase project API settings. Never publish the service-role key in GitHub, source code, screenshots, or a public message. The service-role key bypasses RLS; keep it only in local environment variables and Streamlit Cloud Secrets.
+
+## 3. Configure the Streamlit Cloud app
+
+In the Streamlit Cloud app's **Settings → Secrets**, add:
+
+```toml
+SUPABASE_URL = "https://YOUR_PROJECT_ID.supabase.co"
+SUPABASE_SERVICE_ROLE_KEY = "YOUR_SUPABASE_SERVICE_ROLE_KEY"
+```
+
+Do not commit secrets to GitHub.
+
+## 4. Configure the laptop uploader on Windows
+
+Close Arduino IDE Serial Monitor first. Open Command Prompt in this project folder and install uploader dependencies:
+
+```bat
+python -m pip install pyserial requests
+```
+
+Set environment variables in that same Command Prompt (replace placeholders):
+
+```bat
+set SUPABASE_URL=https://YOUR_PROJECT_ID.supabase.co
+set SUPABASE_SERVICE_ROLE_KEY=YOUR_SUPABASE_SERVICE_ROLE_KEY
+set ARDUINO_PORT=COM3
+python serial_uploader.py
+```
+
+Change `COM3` if Arduino IDE → Tools → Port shows another port. Keep this terminal open while you need live data online.
+
+## 5. Deploy the combined app
+
+1. Upload `app.py`, `requirements.txt`, and the other project files to your existing GitHub repository.
+2. On Streamlit Community Cloud, set the app's main file to `app.py` (or edit the existing app's main file setting).
+3. Add the Supabase secrets described above.
+4. Reboot the app after dependencies and secrets are set.
+5. Open **Live Object Height** in the sidebar. The displayed value updates approximately every 2 seconds.
+6. Choose **AI Surface Defect Detection** for the existing upload-based YOLO and PatchCore workflow.
+
+## Troubleshooting
+
+- **No sensor readings:** check `ARDUINO_PORT`, close Serial Monitor, and check the uploader terminal.
+- **Supabase 401/403:** verify the URL/key and that the key is the service-role/secret key.
+- **No row appears:** inspect the uploader output for upload errors and verify the table name.
+- **Cloud build fails:** AI dependencies such as PyTorch/anomalib are large and version-sensitive. Review Streamlit Cloud logs; pin compatible versions if needed.
+- **High fluctuation remains:** secure the sensor, keep the surface perpendicular, avoid measuring edges/angled/soft surfaces, and verify the empty-ground distance is consistently about 15 cm.
+
+This is a demonstration setup. A service-role key has broad database permissions; for production, replace it with a narrowly scoped authenticated endpoint or Edge Function.
+'''
+(base / "README.md").write_text(readme, encoding="utf-8")
+
+# Basic syntax check on app and uploader.
+import ast
+ast.parse((base / "app.py").read_text(encoding="utf-8"))
+ast.parse((base / "serial_uploader.py").read_text(encoding="utf-8"))
+
+zip_path = Path("/mnt/data/combined_surface_inspection.zip")
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    for p in base.iterdir():
+        zf.write(p, arcname=f"combined_surface_inspection/{p.name}")
+
+print("Created project files:")
+for p in sorted(base.iterdir()):
+    print(f"{p.name}: {p.stat().st_size:,} bytes")
+print(f"ZIP: {zip_path} ({zip_path.stat().st_size:,} bytes)")
