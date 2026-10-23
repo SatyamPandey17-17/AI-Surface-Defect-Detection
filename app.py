@@ -47,7 +47,7 @@ st.set_page_config(
     layout="wide",
 )
 
-st.title("🔍 AI Surface Defect Detection")
+st.title(" Surface Defect Detection")
 
 st.caption(
     "AI-powered steel surface inspection using "
