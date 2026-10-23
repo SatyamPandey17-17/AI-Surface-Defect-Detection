@@ -42,7 +42,7 @@ YOLO_REPO_ID = HF_REPO_ID
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Surface Defect Detection",
+    page_title="Surface Defect Detection",
     page_icon="🔍",
     layout="wide",
 )
@@ -50,7 +50,7 @@ st.set_page_config(
 st.title(" Surface Defect Detection")
 
 st.caption(
-    "AI-powered steel surface inspection using "
+    "OpenCV powered steel surface inspection using "
     "PatchCore anomaly detection and YOLO defect detection."
 )
 
