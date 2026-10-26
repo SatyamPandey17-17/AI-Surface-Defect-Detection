@@ -41,7 +41,6 @@ MAX_BATCH_IMAGES = 6
 
 st.set_page_config(
     page_title="Surface Defect Detection",
-    page_icon="🔍",
     layout="wide",
 )
 
