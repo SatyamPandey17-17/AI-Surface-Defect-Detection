@@ -550,5 +550,4 @@ st.caption(
 )
 '''
 out = Path("/mnt/data/app_phone_camera_batch.py")
-out.write_text(code, encoding="utf-8")
 print(f"Created: {out}")
