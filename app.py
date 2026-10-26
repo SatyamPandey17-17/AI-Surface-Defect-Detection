@@ -1,9 +1,7 @@
-from pathlib import Path
-
-code = r'''from pathlib import Path
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
 import streamlit as st
 import numpy as np
@@ -548,6 +546,3 @@ st.caption(
     "The threshold shown above is a placeholder until calibrated on labelled "
     "validation images. Validate the complete decision rule before relying on it."
 )
-'''
-out = Path("/mnt/data/app_phone_camera_batch.py")
-print(f"Created: {out}")
